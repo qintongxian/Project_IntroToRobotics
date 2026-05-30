@@ -214,8 +214,8 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             %  [低频] Step 5: 主动决策 — 多准则效用融合
             %% ==========================================================
             
-            % 前沿检测
-            frontiers = detect_frontiers_og(og_map, 5);
+            % 前沿检测（WFD：从当前位姿出发的双层BFS）
+            frontiers = detect_frontiers_og(og_map, best_pose, 5);
             
             if isempty(frontiers)
                 state.mode = 'TERMINATED';
