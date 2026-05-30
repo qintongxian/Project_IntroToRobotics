@@ -21,7 +21,8 @@ function visualize_realtime(mode, varargin)
         fig = figure('Name', 'Active SLAM Real-time Monitor', ...
                      'Position', [50 50 1400 900], ...
                      'Color', [0.15 0.15 0.15], ...
-                     'CloseRequestFcn', @(~,~) disp('Visualization window closed.'));
+                     'CloseRequestFcn', @(src,~) delete(src));
+        setappdata(0, 'active_slam_fig_handle', fig);
         
         % 主地图 (占据左上大块)
         h.ax_map = axes('Parent', fig, 'Position', [0.05 0.35 0.55 0.60]);
@@ -276,7 +277,10 @@ function visualize_realtime(mode, varargin)
         
     elseif strcmpi(mode, 'close')
         if ~isempty(fig) && isvalid(fig)
-            close(fig);
+            delete(fig);
+        end
+        if isappdata(0, 'active_slam_fig_handle')
+            rmappdata(0, 'active_slam_fig_handle');
         end
         initialized = false;
         h = [];

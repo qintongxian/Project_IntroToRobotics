@@ -25,6 +25,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
     sensor_range = 10;          % 传感器最大量程 [m]
     sensor_fov = 2*pi;          % 视场角 [rad]
     dt_slam = 0.05;             % SLAM周期 (20Hz = 50ms)
+    robot_radius = 0.3;         % 机器人碰撞半径 [m]
     
     % 触发条件参数
     trigger_params = struct();
@@ -96,8 +97,8 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
     
     %% ========== 仿真环境初始化 (仅仿真模式) ==========
     if strcmpi(sim_mode, 'simulation')
-        % 简单矩形环境 + 障碍物 (landmarks)
-        env_landmarks = generate_simple_environment();
+        % 线段墙体环境 [x1, y1, x2, y2]
+        env_walls = generate_simple_environment();
     end
     
     %% ===================================================================
@@ -110,8 +111,8 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         %% ==============================================================
         if strcmpi(sim_mode, 'simulation')
             [ranges, angles, odom] = sim_sensor_step(x_true, state.current_goal, ...
-                env_landmarks, sensor_params, dt_slam);
-            x_true = sim_motion_step(x_true, odom, dt_slam);
+                env_walls, sensor_params, dt_slam);
+            x_true = sim_motion_step(x_true, odom, dt_slam, env_walls, robot_radius);
         else
             % ROS模式：从话题读取
             error('ROS mode not yet implemented in this demo.');
@@ -289,6 +290,13 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             visualize_realtime('update', og_map, particles, x_true, best_pose, ...
                 trajectory, t, state, trigger_params, belief, ...
                 last_frontiers, last_best_goal, last_criteria);
+            % 检查用户是否手动关闭了可视化窗口
+            fig = getappdata(0, 'active_slam_fig_handle');
+            if ~isempty(fig) && ~isvalid(fig)
+                enable_visualization = false;
+                rmappdata(0, 'active_slam_fig_handle');
+                fprintf('[%d] Visualization window closed by user. Continuing without display.\n', t);
+            end
         end
     end
     
@@ -362,22 +370,27 @@ function belief = extract_belief(particles, M)
     belief.current_entropy = 0.5 * log((2*pi*exp(1))^3 * det_cov);
 end
 
-function lm = generate_simple_environment()
-% 生成简单仿真环境：矩形边界 + 内部障碍物
-    lm = [];
-    % 边界 (20m x 20m)
-    for x = -9:1:9
-        lm = [lm, [x; -9], [x; 9]];
-    end
-    for y = -8:1:8
-        lm = [lm, [-9; y], [9; y]];
-    end
-    % 内部障碍物
-    lm = [lm, [-3; -3], [3; 3], [-3; 3], [3; -3], [0; 5], [0; -5]];
+function walls = generate_simple_environment()
+% 生成简单仿真环境：矩形边界 + 内部障碍物（线段表示）
+%   输出: N×4 矩阵，每行 [x1, y1, x2, y2] 表示一堵墙/线段
+    walls = [
+        % 外墙 (20m x 20m)
+        -9, -9,  9, -9;
+         9, -9,  9,  9;
+         9,  9, -9,  9;
+        -9,  9, -9, -9;
+        
+        % 内部障碍物（线段）
+        -3, -3,  3, -3;   % 下横墙
+        -3,  3,  3,  3;   % 上横墙
+        -3, -3, -3,  3;   % 左竖墙
+         3, -3,  3,  3;   % 右竖墙
+         0,  5,  0, -5;   % 中竖墙
+    ];
 end
 
-function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_lm, sensor_params, dt)
-% 仿真传感器步进
+function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_walls, sensor_params, dt)
+% 仿真传感器步进（实体线段障碍物 + 射线求交）
     % 纯追踪控制器
     dx = current_goal(1) - x_true(1);
     dy = current_goal(2) - x_true(2);
@@ -397,31 +410,18 @@ function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_lm, 
     
     odom = [v_cmd; omega_cmd];
     
-    % 模拟激光扫描：对环境中每个landmark计算range-bearing
+    % 模拟激光扫描：射线与线段求交
     N_beams = 72;  % 每5度一束
     angles = linspace(-pi, pi, N_beams)';
     ranges = sensor_params.range_max * ones(N_beams, 1);
     
     for i = 1:N_beams
-        phi = angles(i);
-        % 射线方向
-        ray_x = cos(x_true(3) + phi);
-        ray_y = sin(x_true(3) + phi);
+        theta = x_true(3) + angles(i);
+        dir = [cos(theta), sin(theta)];
         
-        for j = 1:size(env_lm, 2)
-            dx_lm = env_lm(1, j) - x_true(1);
-            dy_lm = env_lm(2, j) - x_true(2);
-            % 投影到射线方向
-            proj = dx_lm * ray_x + dy_lm * ray_y;
-            if proj > 0 && proj < ranges(i)
-                % 检查是否在同一直线上（简化：点 landmark 直接算距离）
-                dist_lm = sqrt(dx_lm^2 + dy_lm^2);
-                angle_lm = atan2(dy_lm, dx_lm) - x_true(3);
-                angle_lm = atan2(sin(angle_lm), cos(angle_lm));
-                if abs(angle_lm - phi) < pi/N_beams
-                    ranges(i) = dist_lm;
-                end
-            end
+        t = ray_segment_intersection(x_true(1:2)', dir, env_walls);
+        if t < inf && t < ranges(i)
+            ranges(i) = t;
         end
     end
     
@@ -430,8 +430,12 @@ function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_lm, 
     ranges = max(sensor_params.range_min, min(ranges, sensor_params.range_max));
 end
 
-function x_new = sim_motion_step(x, odom, dt)
-% 仿真运动步进（差速模型）
+function x_new = sim_motion_step(x, odom, dt, env_walls, robot_radius)
+% 仿真运动步进（差速模型 + 线段碰撞检测）
+    if nargin < 5
+        robot_radius = 0.3;
+    end
+    
     v = odom(1);
     w = odom(2);
     x_new = x;
@@ -439,6 +443,24 @@ function x_new = sim_motion_step(x, odom, dt)
     x_new(2) = x(2) + v * dt * sin(x(3) + w*dt/2);
     x_new(3) = x(3) + w * dt;
     x_new(3) = atan2(sin(x_new(3)), cos(x_new(3)));
+    
+    % 碰撞检测与响应（二分查找安全位置）
+    if nargin >= 4 && ~isempty(env_walls)
+        min_dist = point_to_segment_distance(x_new(1:2)', env_walls);
+        if min_dist < robot_radius
+            % 发生碰撞：从旧位置向新位置二分查找刚好不碰的位置
+            x_old_pos = x(1:2);
+            x_new_pos = x_new(1:2);
+            safe_pos = x_old_pos;
+            for step = 0.5.^(1:6)
+                test_pos = safe_pos + step * (x_new_pos - x_old_pos);
+                if point_to_segment_distance(test_pos', env_walls) >= robot_radius
+                    safe_pos = test_pos;
+                end
+            end
+            x_new(1:2) = safe_pos;
+        end
+    end
     
     % 加运动噪声
     x_new = x_new + [0.02*randn(); 0.02*randn(); 0.01*randn()];
