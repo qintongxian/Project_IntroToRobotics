@@ -56,6 +56,6 @@ function [state, trigger_params] = state_machine_update(state, belief, trigger_p
             
         case 'TERMINATED'
             % 探索完成，不再触发
-            ;
+            
     end
 end

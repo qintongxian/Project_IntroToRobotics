@@ -43,6 +43,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
     state.need_decision = false;
     state.current_goal = [0; 0; 0];
     state.current_path = [];
+    state.current_wp_idx = 1;
     state.loop_closure_completed = false;
     state.exploration_complete = false;
     
@@ -110,9 +111,34 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         %  [高频] Step 1: 获取传感器数据
         %% ==============================================================
         if strcmpi(sim_mode, 'simulation')
-            [ranges, angles, odom] = sim_sensor_step(x_true, state.current_goal, ...
+            x_true_prev = x_true;
+            
+            % 路径跟踪：如果有A*路径，跟踪当前路点而非直冲终点
+            if ~isempty(state.current_path) && state.current_wp_idx <= size(state.current_path, 1)
+                wp = state.current_path(state.current_wp_idx, :)';
+                % 若已接近当前路点，切换到下一路点
+                if norm(x_true(1:2) - wp(1:2)) < 0.5 && state.current_wp_idx < size(state.current_path, 1)
+                    state.current_wp_idx = state.current_wp_idx + 1;
+                    wp = state.current_path(state.current_wp_idx, :)';
+                end
+            else
+                wp = state.current_goal(1:2);
+            end
+            
+            [ranges, angles, odom_cmd] = sim_sensor_step(x_true, wp, ...
                 env_walls, sensor_params, dt_slam);
-            x_true = sim_motion_step(x_true, odom, dt_slam, env_walls, robot_radius);
+            x_true = sim_motion_step(x_true, odom_cmd, dt_slam, env_walls, robot_radius);
+            
+            % 关键修复：FastSLAM 必须使用与实际运动一致的里程计。
+            % 碰撞/卡墙时真实位姿停滞，若继续用理想控制指令 odom_cmd，
+            % 粒子会前进而真值不动，导致严重定位漂移。
+            delta_theta = atan2(sin(x_true(3) - x_true_prev(3)), ...
+                                cos(x_true(3) - x_true_prev(3)));
+            mid_theta = x_true_prev(3) + delta_theta / 2;
+            actual_v = ((x_true(1) - x_true_prev(1)) * cos(mid_theta) + ...
+                        (x_true(2) - x_true_prev(2)) * sin(mid_theta)) / dt_slam;
+            actual_w = delta_theta / dt_slam;
+            odom = [actual_v; actual_w];
         else
             % ROS模式：从话题读取
             error('ROS mode not yet implemented in this demo.');
@@ -241,6 +267,19 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             [~, sort_idx] = sort(dists, 'ascend');
             candidate_goals = frontiers(sort_idx(1:n_candidates), :);
             
+            % 关键修复：过滤直线路径被墙阻挡的候选目标。
+            % 效用函数里的路径熵只算不确定栅格，不算被 occupied 墙挡住的情况。
+            reachable_mask = true(size(candidate_goals, 1), 1);
+            for icand = 1:size(candidate_goals, 1)
+                reachable_mask(icand) = ~is_path_blocked(og_map, best_pose(1:2)', candidate_goals(icand, :));
+            end
+            candidate_goals = candidate_goals(reachable_mask, :);
+            
+            if isempty(candidate_goals)
+                % 无可达前沿，向前直行探索
+                candidate_goals = best_pose(1:2)' + [cos(best_pose(3)), sin(best_pose(3))] * 2.0;
+            end
+            
             % 多准则效用融合
             [utilities, best_idx_local, criteria] = multi_criteria_utility_fusion(...
                 particles, og_map, candidate_goals, best_pose, utility_params);
@@ -251,6 +290,18 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             end
             
             best_goal = candidate_goals(best_idx_local, :);
+            
+            % === A* 路径规划 ===
+            % 在OG地图上规划从当前位姿到best_goal的可行路径
+            path_world = astar_og(og_map, best_pose(1:2)', best_goal, robot_radius);
+            if ~isempty(path_world)
+                state.current_path = path_world;
+                state.current_wp_idx = 2;  % 从路径第二个点开始（第一个是起点）
+            else
+                % A* 失败，直接走直线（至少已在候选阶段过滤了被墙挡的）
+                state.current_path = [best_pose(1:2)'; best_goal];
+                state.current_wp_idx = 2;
+            end
             
             % 构建目标姿态
             dx = best_goal(1) - best_pose(1);
@@ -383,9 +434,9 @@ function walls = generate_simple_environment()
         % 内部障碍物（线段）
         -3, -3,  3, -3;   % 下横墙
         -3,  3,  3,  3;   % 上横墙
-        -3, -3, -3,  3;   % 左竖墙
-         3, -3,  3,  3;   % 右竖墙
-         0,  5,  0, -5;   % 中竖墙
+        -3,  0, -3,  3;   % 左竖墙
+         3,  0,  3,  3;   % 右竖墙
+         0, -1,  0, -3;   % 中竖墙
     ];
 end
 
