@@ -110,9 +110,21 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         %  [高频] Step 1: 获取传感器数据
         %% ==============================================================
         if strcmpi(sim_mode, 'simulation')
-            [ranges, angles, odom] = sim_sensor_step(x_true, state.current_goal, ...
+            x_true_prev = x_true;
+            [ranges, angles, odom_cmd] = sim_sensor_step(x_true, state.current_goal, ...
                 env_walls, sensor_params, dt_slam);
-            x_true = sim_motion_step(x_true, odom, dt_slam, env_walls, robot_radius);
+            x_true = sim_motion_step(x_true, odom_cmd, dt_slam, env_walls, robot_radius);
+            
+            % 关键修复：FastSLAM 必须使用与实际运动一致的里程计。
+            % 碰撞/卡墙时真实位姿停滞，若继续用理想控制指令 odom_cmd，
+            % 粒子会前进而真值不动，导致严重定位漂移。
+            delta_theta = atan2(sin(x_true(3) - x_true_prev(3)), ...
+                                cos(x_true(3) - x_true_prev(3)));
+            mid_theta = x_true_prev(3) + delta_theta / 2;
+            actual_v = ((x_true(1) - x_true_prev(1)) * cos(mid_theta) + ...
+                        (x_true(2) - x_true_prev(2)) * sin(mid_theta)) / dt_slam;
+            actual_w = delta_theta / dt_slam;
+            odom = [actual_v; actual_w];
         else
             % ROS模式：从话题读取
             error('ROS mode not yet implemented in this demo.');
