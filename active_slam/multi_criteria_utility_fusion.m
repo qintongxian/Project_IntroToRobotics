@@ -100,7 +100,8 @@ function [utilities, best_idx, criteria] = multi_criteria_utility_fusion(particl
         U_Geo = -params.w_dist*dist_cost - params.w_path*H_path - params.w_turn*delta_theta;
         
         % ===== 融合 =====
-        utilities(i) = w_IT*U_IT + w_TOED*U_TOED + w_Graph*U_Graph + w_Geo*U_Geo;
+        utilities(i) = w_IT*U_IT + w_TOED*U_TOED + w_Graph*U_Graph;
+        utilities(i) = utilities(i) + w_Geo*U_Geo;
         
         % 如果仍有NaN（如IT层计算失败），只用几何层
         if isnan(utilities(i))

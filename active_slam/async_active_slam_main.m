@@ -105,6 +105,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
     %% ===================================================================
     %  T_max 高频主循环
     %% ===================================================================
+    stuck_steps = 0;  % 卡住步数计数器
     for t = 1:T_max
         
         %% ==============================================================
@@ -139,6 +140,32 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
                         (x_true(2) - x_true_prev(2)) * sin(mid_theta)) / dt_slam;
             actual_w = delta_theta / dt_slam;
             odom = [actual_v; actual_w];
+            
+            % ========== 卡住检测与恢复 ==========
+            actual_move = norm(x_true(1:2) - x_true_prev(1:2));
+            if actual_move < 0.02
+                stuck_steps = stuck_steps + 1;
+            else
+                stuck_steps = 0;
+            end
+            
+            if stuck_steps > 20  % 约1秒未明显移动
+                fprintf('[%d] Robot stuck! Backing away from wall...\n', t);
+                % 后退并转向更空旷的一侧
+                x_true(1) = x_true(1) - 0.3 * cos(x_true(3));
+                x_true(2) = x_true(2) - 0.3 * sin(x_true(3));
+                x_true(3) = x_true(3) + pi/3 * sign(randn());
+                x_true(3) = atan2(sin(x_true(3)), cos(x_true(3)));
+                
+                % 确保后退位置安全
+                if point_to_segment_distance(x_true(1:2)', env_walls) < robot_radius
+                    x_true(1:2) = x_true_prev(1:2);
+                end
+                
+                % 强制重新决策
+                state.need_decision = true;
+                stuck_steps = 0;
+            end
         else
             % ROS模式：从话题读取
             error('ROS mode not yet implemented in this demo.');
@@ -266,14 +293,14 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             dists = sqrt(sum((frontiers - best_pose(1:2)').^2, 2));
             [~, sort_idx] = sort(dists, 'ascend');
             candidate_goals = frontiers(sort_idx(1:n_candidates), :);
-            
-            % 关键修复：过滤直线路径被墙阻挡的候选目标。
-            % 效用函数里的路径熵只算不确定栅格，不算被 occupied 墙挡住的情况。
-            reachable_mask = true(size(candidate_goals, 1), 1);
-            for icand = 1:size(candidate_goals, 1)
-                reachable_mask(icand) = ~is_path_blocked(og_map, best_pose(1:2)', candidate_goals(icand, :));
-            end
-            candidate_goals = candidate_goals(reachable_mask, :);
+            % 
+            % % 关键修复：过滤直线路径被墙阻挡的候选目标。
+            % % 效用函数里的路径熵只算不确定栅格，不算被 occupied 墙挡住的情况。
+            % reachable_mask = true(size(candidate_goals, 1), 1);
+            % for icand = 1:size(candidate_goals, 1)
+            %     reachable_mask(icand) = ~is_path_blocked(og_map, best_pose(1:2)', candidate_goals(icand, :));
+            % end
+            % candidate_goals = candidate_goals(reachable_mask, :);
             
             if isempty(candidate_goals)
                 % 无可达前沿，向前直行探索
@@ -325,7 +352,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         %% ==============================================================
         %  Step 6: 终止条件
         %% ==============================================================
-        if og_map.unknownRatio() < 0.05
+        if og_map.unknownRatio() < 0.01
             state.mode = 'TERMINATED';
             fprintf('Exploration completed at step %d (unknown < 5%%)\n', t);
             break;
@@ -432,11 +459,26 @@ function walls = generate_simple_environment()
         -9,  9, -9, -9;
         
         % 内部障碍物（线段）
-        -3, -3,  3, -3;   % 下横墙
-        -3,  3,  3,  3;   % 上横墙
-        -3,  0, -3,  3;   % 左竖墙
-         3,  0,  3,  3;   % 右竖墙
-         0, -1,  0, -3;   % 中竖墙
+        -9,  3, -8,  3;
+        -7,  3, -1,  3;
+         1,  3,  4,  3;
+         5,  3,  9,  3; % 上方房间横墙
+        -6,  3, -6,  7;
+        -6,  8, -6,  9;
+        -3,  3, -3,  4;
+        -3,  5, -3,  9;
+         3,  3,  3,  5;
+         3,  7,  3,  9; % 上方房间竖墙
+        -9, -3, -8, -3;
+        -7, -3, -1, -3;
+         1, -3,  4, -3;
+         5, -3,  9, -3; % 上方房间横墙
+        -6, -3, -6, -7;
+        -6, -8, -6, -9;
+        -3, -3, -3, -4;
+        -3, -5, -3, -9;
+         3, -3,  3, -5;
+         3, -7,  3, -9; % 上方房间竖墙
     ];
 end
 
@@ -459,8 +501,6 @@ function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_wall
         omega_cmd = 0;
     end
     
-    odom = [v_cmd; omega_cmd];
-    
     % 模拟激光扫描：射线与线段求交
     N_beams = 72;  % 每5度一束
     angles = linspace(-pi, pi, N_beams)';
@@ -479,6 +519,36 @@ function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_wall
     % 加噪声
     ranges = ranges + 0.05 * randn(size(ranges));
     ranges = max(sensor_params.range_min, min(ranges, sensor_params.range_max));
+    
+    %% ========== 局部避障层：尽量不要贴墙 ==========
+    robot_radius_local = 0.3;
+    safety_margin = 0.5;    % 安全余量：障碍物距离 < 0.8m 就反应
+    front_fov = pi / 3;     % 前方60度扇区
+    
+    front_mask = abs(angles) < front_fov;
+    front_ranges = ranges(front_mask);
+    
+    if ~isempty(front_ranges) && min(front_ranges) < robot_radius_local + safety_margin
+        % 前方过近：大幅减速
+        v_cmd = v_cmd * 0.3;
+        
+        % 比较左右两侧的平均可用空间，向更空旷侧转向
+        left_mask = angles > 0;
+        right_mask = angles < 0;
+        left_space = mean(ranges(left_mask & isfinite(ranges)));
+        right_space = mean(ranges(right_mask & isfinite(ranges)));
+        
+        if isnan(left_space), left_space = 0; end
+        if isnan(right_space), right_space = 0; end
+        
+        if left_space > right_space
+            omega_cmd = omega_max * 0.8;   % 左转
+        else
+            omega_cmd = -omega_max * 0.8;  % 右转
+        end
+    end
+    
+    odom = [v_cmd; omega_cmd];
 end
 
 function x_new = sim_motion_step(x, odom, dt, env_walls, robot_radius)
