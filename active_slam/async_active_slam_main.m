@@ -127,7 +127,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
             end
             
             [ranges, angles, odom_cmd] = sim_sensor_step(x_true, wp, ...
-                env_walls, sensor_params, dt_slam);
+                env_walls, sensor_params, dt_slam, robot_radius);
             x_true = sim_motion_step(x_true, odom_cmd, dt_slam, env_walls, robot_radius);
             
             % 关键修复：FastSLAM 必须使用与实际运动一致的里程计。
@@ -482,25 +482,8 @@ function walls = generate_simple_environment()
     ];
 end
 
-function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_walls, sensor_params, dt)
+function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_walls, sensor_params, dt, robot_radius)
 % 仿真传感器步进（实体线段障碍物 + 射线求交）
-    % 纯追踪控制器
-    dx = current_goal(1) - x_true(1);
-    dy = current_goal(2) - x_true(2);
-    target_heading = atan2(dy, dx);
-    heading_error = atan2(sin(target_heading - x_true(3)), cos(target_heading - x_true(3)));
-    dist_to_goal = sqrt(dx^2 + dy^2);
-    
-    v_max = 1.0;
-    omega_max = 0.5;
-    v_cmd = min(v_max, dist_to_goal * 0.5);
-    omega_cmd = max(-omega_max, min(omega_max, heading_error * 2.0));
-    
-    if dist_to_goal < 0.5
-        v_cmd = 0;
-        omega_cmd = 0;
-    end
-    
     % 模拟激光扫描：射线与线段求交
     N_beams = 72;  % 每5度一束
     angles = linspace(-pi, pi, N_beams)';
@@ -520,33 +503,8 @@ function [ranges, angles, odom] = sim_sensor_step(x_true, current_goal, env_wall
     ranges = ranges + 0.05 * randn(size(ranges));
     ranges = max(sensor_params.range_min, min(ranges, sensor_params.range_max));
     
-    %% ========== 局部避障层：尽量不要贴墙 ==========
-    robot_radius_local = 0.3;
-    safety_margin = 0.5;    % 安全余量：障碍物距离 < 0.8m 就反应
-    front_fov = pi / 3;     % 前方60度扇区
-    
-    front_mask = abs(angles) < front_fov;
-    front_ranges = ranges(front_mask);
-    
-    if ~isempty(front_ranges) && min(front_ranges) < robot_radius_local + safety_margin
-        % 前方过近：大幅减速
-        v_cmd = v_cmd * 0.3;
-        
-        % 比较左右两侧的平均可用空间，向更空旷侧转向
-        left_mask = angles > 0;
-        right_mask = angles < 0;
-        left_space = mean(ranges(left_mask & isfinite(ranges)));
-        right_space = mean(ranges(right_mask & isfinite(ranges)));
-        
-        if isnan(left_space), left_space = 0; end
-        if isnan(right_space), right_space = 0; end
-        
-        if left_space > right_space
-            omega_cmd = omega_max * 0.8;   % 左转
-        else
-            omega_cmd = -omega_max * 0.8;  % 右转
-        end
-    end
+    %% ========== APF 局部控制器 ==========
+    [v_cmd, omega_cmd] = apf_velocity_command(x_true, current_goal, ranges, angles, robot_radius);
     
     odom = [v_cmd; omega_cmd];
 end
@@ -580,6 +538,17 @@ function x_new = sim_motion_step(x, odom, dt, env_walls, robot_radius)
                 end
             end
             x_new(1:2) = safe_pos;
+            
+            % APF 微调：若仍贴墙，沿法向轻轻外推，减少再次碰撞概率
+            min_dist2 = point_to_segment_distance(x_new(1:2)', env_walls);
+            if min_dist2 < robot_radius + 0.05
+                [~, nearest_pt] = point_to_segment_distance(x_new(1:2)', env_walls);
+                normal = x_new(1:2) - nearest_pt';
+                n_norm = norm(normal);
+                if n_norm > 1e-6
+                    x_new(1:2) = x_new(1:2) + (0.03 / n_norm) * normal;
+                end
+            end
         end
     end
     
