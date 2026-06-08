@@ -26,7 +26,7 @@ end
 % sample from proposal distribution
 xvs= multivariate_gauss(xv,Pv,1); 
 particle.xv= xvs;
-particle.Pv= zeros(3);
+particle.Pv= Pv;  % 保留提议分布协方差，避免不确定性信息丢失
 
 % compute sample weight: w = w * p(z|xk) p(xk|xk-1) / proposal
 like = likelihood_given_xv(particle, z,idf, R);

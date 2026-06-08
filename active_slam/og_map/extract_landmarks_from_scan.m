@@ -61,7 +61,10 @@ function [zf, idf, zn, updated_landmarks] = extract_landmarks_from_scan(ranges, 
     dists = sqrt(sum((pts_next - pts_local).^2, 2));  % N x 1
     
     % breakpoint 检测：相邻端点距离超过阈值 => 存在不连续（墙角/边缘）
-    is_break = dists > sensor_params.break_threshold;
+    % 关键修复：远距离时相邻端点的自然间距本身就大，固定阈值会误判直墙
+    angle_res = 2*pi / n_valid;  % 相邻激光束角度间隔
+    natural_spacing = 2 * r_valid .* sin(angle_res / 2);  % 光滑表面上的相邻端点距离
+    is_break = dists > max(sensor_params.break_threshold, natural_spacing * 1.5);
     
     % 端点标记：breakpoint 的两侧点都是端点候选
     % is_break(i) 表示 pts(i) 与 pts(i+1) 之间不连续

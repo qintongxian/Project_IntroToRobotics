@@ -32,7 +32,8 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
     trigger_params.N_period = 50;               % 时间触发：每50步
     trigger_params.time_counter = 0;
     trigger_params.spatial_threshold = 2.0;     % 空间触发：距目标<2m
-    trigger_params.sigma_threshold = 0.5;       % 不确定性阈值
+    trigger_params.sigma_threshold = 1e-4;      % 不确定性阈值（trace尺度，约为3倍底噪）
+    trigger_params.loop_closure_threshold = 5e-4;% 回环触发：不确定性严重超标（trace尺度，约为15倍底噪）
     trigger_params.alpha_decay = 0.995;         % 自适应衰减
     trigger_params.Neff_threshold = M * 0.3;    % 粒子退化阈值
     trigger_params.reason = '';
@@ -175,7 +176,7 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         %  [高频] Step 2: FastSLAM 2.0 更新
         %% ==============================================================
         % 运动预测（差速模型）
-        Q_motion = diag([0.01, 0.005]);  % [v_noise^2, w_noise^2]
+        Q_motion = diag([0.01, 0.005]);  % [v_noise^2, w_noise^2]  与真值直接位姿噪声匹配
         for k = 1:M
             particles(k) = predict_diffdrive(particles(k), odom(1), odom(2), Q_motion, dt_slam, 1);
         end
@@ -261,92 +262,121 @@ function [trajectory, maps, entropy_history, state_log, criteria_log] = async_ac
         [state, trigger_params] = state_machine_update(state, belief, trigger_params);
         
         if state.need_decision
-            fprintf('[%d] Decision triggered! Reason: %s | Pose uncertainty: %.4f | Unknown: %.2f%%\n', ...
-                t, trigger_params.reason, det(belief.pose_cov), og_map.unknownRatio()*100);
+            fprintf('[%d] Decision triggered! Reason: %s | Pose uncertainty: %.4e | Unknown: %.2f%%\n', ...
+                t, trigger_params.reason, trace(belief.pose_cov), og_map.unknownRatio()*100);
             
-            %% ==========================================================
-            %  [低频] Step 5: 主动决策 — 多准则效用融合
-            %% ==========================================================
-            
-            % 前沿检测（WFD：从当前位姿出发的双层BFS）
-            frontiers = detect_frontiers_og(og_map, best_pose, 5);
-            
-            if isempty(frontiers)
-                state.mode = 'TERMINATED';
-                state.exploration_complete = true;
-                fprintf('Exploration completed at step %d (no frontiers)\n', t);
-                break;
+            switch state.mode
+                case 'REPLANNING'
+                    %% ==========================================================
+                    %  [低频] Step 5a: 正常探索 — 多准则效用融合
+                    %% ==========================================================
+                    
+                    % 前沿检测（WFD：从当前位姿出发的双层BFS）
+                    frontiers = detect_frontiers_og(og_map, best_pose, 5);
+                    
+                    if isempty(frontiers)
+                        state.mode = 'TERMINATED';
+                        state.exploration_complete = true;
+                        fprintf('Exploration completed at step %d (no frontiers)\n', t);
+                        break;
+                    end
+                    
+                    % 过滤过近的前沿（避免机器人反复选择脚下同一个点）
+                    dists = sqrt(sum((frontiers - best_pose(1:2)').^2, 2));
+                    frontiers = frontiers(dists > 0.8, :);  % 至少距离当前位置0.8m
+                    
+                    if isempty(frontiers)
+                        % 无合适前沿，向前直行探索
+                        frontiers = best_pose(1:2)' + [cos(best_pose(3)), sin(best_pose(3))] * 2.0;
+                    end
+                    
+                    % 限制候选数量
+                    n_candidates = min(size(frontiers, 1), 15);
+                    % 按距当前位置距离排序，优先评估近的前沿
+                    dists = sqrt(sum((frontiers - best_pose(1:2)').^2, 2));
+                    [~, sort_idx] = sort(dists, 'ascend');
+                    candidate_goals = frontiers(sort_idx(1:n_candidates), :);
+                    
+                    if isempty(candidate_goals)
+                        % 无可达前沿，向前直行探索
+                        candidate_goals = best_pose(1:2)' + [cos(best_pose(3)), sin(best_pose(3))] * 2.0;
+                    end
+                    
+                    % 多准则效用融合
+                    [utilities, best_idx_local, criteria] = multi_criteria_utility_fusion(...
+                        particles, og_map, candidate_goals, best_pose, utility_params);
+                    
+                    % 如果效用全为NaN，回退到距离最近的前沿
+                    if all(isnan(utilities))
+                        best_idx_local = 1;
+                    end
+                    
+                    best_goal = candidate_goals(best_idx_local, :);
+                    
+                    % === A* 路径规划 ===
+                    path_world = astar_og(og_map, best_pose(1:2)', best_goal, robot_radius);
+                    if ~isempty(path_world)
+                        state.current_path = path_world;
+                        state.current_wp_idx = 2;  % 从路径第二个点开始（第一个是起点）
+                    else
+                        % A* 失败，直接走直线
+                        state.current_path = [best_pose(1:2)'; best_goal];
+                        state.current_wp_idx = 2;
+                    end
+                    
+                    % 构建目标姿态
+                    dx = best_goal(1) - best_pose(1);
+                    dy = best_goal(2) - best_pose(2);
+                    target_theta = atan2(dy, dx);
+                    
+                    state.current_goal = [best_goal(1); best_goal(2); target_theta];
+                    state.need_decision = false;
+                    state.mode = 'EXECUTING';
+                    
+                    % 保存准则日志
+                    criteria_log{criteria_idx} = criteria;
+                    criteria_idx = criteria_idx + 1;
+                    
+                    % 更新可视化缓存
+                    last_criteria = criteria;
+                    last_frontiers = frontiers;
+                    last_best_goal = best_goal;
+                    
+                case 'LOOP_CLOSURE'
+                    %% ==========================================================
+                    %  [低频] Step 5b: 主动回环闭合
+                    %% ==========================================================
+                    
+                    [loop_goal, loop_path] = active_loop_closure_decision(...
+                        best_pose_history(:, 1:t), best_pose, og_map, robot_radius, trigger_params.spatial_threshold);
+                    
+                    if isempty(loop_goal)
+                        fprintf('[%d] Loop closure failed (no candidate), fallback to exploration.\n', t);
+                        state.mode = 'REPLANNING';
+                        % need_decision 保持 true，下一轮重新进入 REPLANNING 分支
+                    else
+                        if ~isempty(loop_path)
+                            state.current_path = loop_path;
+                            state.current_wp_idx = 2;
+                        else
+                            state.current_path = [best_pose(1:2)'; loop_goal(1:2)'];
+                            state.current_wp_idx = 2;
+                        end
+                        
+                        state.current_goal = loop_goal;
+                        state.need_decision = false;
+                        % 状态保持 LOOP_CLOSURE，直到到达目标后状态机自动切回 REPLANNING
+                        
+                        fprintf('[%d] Loop closure: heading to [%.2f, %.2f]\n', t, loop_goal(1), loop_goal(2));
+                        
+                        % 简化日志
+                        criteria_log{criteria_idx} = struct('mode', 'loop_closure', ...
+                            'goal', loop_goal(1:2)', 'path_length', size(loop_path,1));
+                        criteria_idx = criteria_idx + 1;
+                        last_best_goal = loop_goal(1:2)';
+                        last_frontiers = [];  % 回环时不显示前沿
+                    end
             end
-            
-            % 过滤过近的前沿（避免机器人反复选择脚下同一个点）
-            dists = sqrt(sum((frontiers - best_pose(1:2)').^2, 2));
-            frontiers = frontiers(dists > 0.8, :);  % 至少距离当前位置0.8m
-            
-            if isempty(frontiers)
-                % 无合适前沿，向前直行探索
-                frontiers = best_pose(1:2)' + [cos(best_pose(3)), sin(best_pose(3))] * 2.0;
-            end
-            
-            % 限制候选数量
-            n_candidates = min(size(frontiers, 1), 15);
-            % 按距当前位置距离排序，优先评估近的前沿
-            dists = sqrt(sum((frontiers - best_pose(1:2)').^2, 2));
-            [~, sort_idx] = sort(dists, 'ascend');
-            candidate_goals = frontiers(sort_idx(1:n_candidates), :);
-            % 
-            % % 关键修复：过滤直线路径被墙阻挡的候选目标。
-            % % 效用函数里的路径熵只算不确定栅格，不算被 occupied 墙挡住的情况。
-            % reachable_mask = true(size(candidate_goals, 1), 1);
-            % for icand = 1:size(candidate_goals, 1)
-            %     reachable_mask(icand) = ~is_path_blocked(og_map, best_pose(1:2)', candidate_goals(icand, :));
-            % end
-            % candidate_goals = candidate_goals(reachable_mask, :);
-            
-            if isempty(candidate_goals)
-                % 无可达前沿，向前直行探索
-                candidate_goals = best_pose(1:2)' + [cos(best_pose(3)), sin(best_pose(3))] * 2.0;
-            end
-            
-            % 多准则效用融合
-            [utilities, best_idx_local, criteria] = multi_criteria_utility_fusion(...
-                particles, og_map, candidate_goals, best_pose, utility_params);
-            
-            % 如果效用全为NaN，回退到距离最近的前沿
-            if all(isnan(utilities))
-                best_idx_local = 1;
-            end
-            
-            best_goal = candidate_goals(best_idx_local, :);
-            
-            % === A* 路径规划 ===
-            % 在OG地图上规划从当前位姿到best_goal的可行路径
-            path_world = astar_og(og_map, best_pose(1:2)', best_goal, robot_radius);
-            if ~isempty(path_world)
-                state.current_path = path_world;
-                state.current_wp_idx = 2;  % 从路径第二个点开始（第一个是起点）
-            else
-                % A* 失败，直接走直线（至少已在候选阶段过滤了被墙挡的）
-                state.current_path = [best_pose(1:2)'; best_goal];
-                state.current_wp_idx = 2;
-            end
-            
-            % 构建目标姿态
-            dx = best_goal(1) - best_pose(1);
-            dy = best_goal(2) - best_pose(2);
-            target_theta = atan2(dy, dx);
-            
-            state.current_goal = [best_goal(1); best_goal(2); target_theta];
-            state.need_decision = false;
-            state.mode = 'EXECUTING';
-            
-            % 保存准则日志
-            criteria_log{criteria_idx} = criteria;
-            criteria_idx = criteria_idx + 1;
-            
-            % 更新可视化缓存
-            last_criteria = criteria;
-            last_frontiers = frontiers;
-            last_best_goal = best_goal;
         end
         
         %% ==============================================================
@@ -436,7 +466,16 @@ function belief = extract_belief(particles, M)
     
     centered = poses - belief.pose_mean;
     centered(3, :) = atan2(sin(centered(3, :)), cos(centered(3, :)));
-    belief.pose_cov = (centered .* weights) * centered' + 1e-6*eye(3);
+    
+    % 粒子间协方差（后验分布的离散程度）
+    inter_cov = (centered .* weights) * centered';
+    
+    % 粒子内部协方差（向量化提取，避免每步遍历结构体数组）
+    Pv_all = cat(3, particles.Pv);  % 3 x 3 x M
+    intra_cov = sum(Pv_all .* reshape(weights, 1, 1, []), 3);
+    
+    % 总协方差 = 组间方差 + 组内方差（总方差定律）
+    belief.pose_cov = inter_cov + intra_cov + 1e-6*eye(3);
     belief.pose_cov = 0.5*(belief.pose_cov + belief.pose_cov');
     
     belief.Neff = 1 / sum(weights.^2);
@@ -583,8 +622,8 @@ function x_new = sim_motion_step(x, odom, dt, env_walls, robot_radius)
         end
     end
     
-    % 加运动噪声
-    x_new = x_new + [0.02*randn(); 0.02*randn(); 0.01*randn()];
+    % 加运动噪声（直接位姿扰动，模拟执行器误差；不宜过大否则真值本身随机游走严重）
+    x_new = x_new + [0.005*randn(); 0.005*randn(); 0.002*randn()];
 end
 
 function visualize_final(og_map, trajectory, state_log, entropy_history)

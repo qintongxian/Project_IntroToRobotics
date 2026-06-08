@@ -36,7 +36,11 @@ function [state, trigger_params] = state_machine_update(state, belief, trigger_p
             % 高频SLAM持续运行，监控触发条件
             [should_replan, trigger_params] = trigger_conditions(belief, state, trigger_params);
             if should_replan
-                state.mode = 'REPLANNING';
+                if strcmp(trigger_params.reason, 'loop_closure')
+                    state.mode = 'LOOP_CLOSURE';
+                else
+                    state.mode = 'REPLANNING';
+                end
                 state.need_decision = true;
             end
             
@@ -47,7 +51,14 @@ function [state, trigger_params] = state_machine_update(state, belief, trigger_p
             end
             
         case 'LOOP_CLOSURE'
-            % 回环闭合模式
+            % 回环闭合模式：执行回环路径中，只检查是否到达目标
+            if isfield(state, 'current_goal') && ~isempty(state.current_goal)
+                dist_to_goal = norm(belief.pose_mean(1:2) - state.current_goal(1:2));
+                if dist_to_goal < trigger_params.spatial_threshold
+                    state.loop_closure_completed = true;
+                end
+            end
+            
             if state.loop_closure_completed
                 state.mode = 'REPLANNING';
                 state.need_decision = true;

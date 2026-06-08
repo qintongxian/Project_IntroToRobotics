@@ -69,7 +69,7 @@ function path_world = astar_og(og_map, start_pos, goal_pos, robot_radius)
         closed(ci, cj) = true;
         
         if ci == gi && cj == gj
-            % 重建路径
+            % 重建路径（回溯 parent 链）
             path_grid = [];
             pi = gi; pj = gj;
             while ~(pi == si && pj == sj)
@@ -81,7 +81,8 @@ function path_world = astar_og(og_map, start_pos, goal_pos, robot_radius)
                 end
                 pi = pi_next; pj = pj_next;
             end
-            path_grid = [si, sj; path_grid; gi, gj];
+            % 起点在循环退出时还未加入；终点已在循环第一步加入，不可重复
+            path_grid = [si, sj; path_grid];
             
             % 转为世界坐标（栅格中心）
             path_world = zeros(size(path_grid, 1), 2);

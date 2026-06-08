@@ -11,7 +11,7 @@ function visualize_realtime(mode, varargin)
 %
 %   使用 persistent 句柄避免重复创建图形对象
 
-    persistent h fig initialized
+    persistent h fig initialized err_t_hist err_x_hist err_y_hist err_th_hist
     
     if strcmpi(mode, 'init')
         %% ========== 首次创建 ==========
@@ -114,6 +114,7 @@ function visualize_realtime(mode, varargin)
         title('Utility of Candidates', 'Color', [1 1 1], 'FontSize', 11);
         
         initialized = true;
+        err_t_hist = []; err_x_hist = []; err_y_hist = []; err_th_hist = [];
         drawnow limitrate;
         
     elseif strcmpi(mode, 'update') && initialized
@@ -234,15 +235,18 @@ function visualize_realtime(mode, varargin)
                             max(criteria.IT + criteria.TOED + criteria.Graph + criteria.Geo));
         set(h.txt_info, 'String', info_str);
         
-        % --- 位姿误差历史（简化：只显示当前步的误差）---
+        % --- 位姿误差历史 ---
         if t > 1
-            set(h.err_x, 'XData', [get(h.err_x, 'XData'), t], ...
-                'YData', [get(h.err_x, 'YData'), abs(x_true(1) - best_pose(1))]);
-            set(h.err_y, 'XData', [get(h.err_y, 'XData'), t], ...
-                'YData', [get(h.err_y, 'YData'), abs(x_true(2) - best_pose(2))]);
-            theta_err = atan2(sin(x_true(3) - best_pose(3)), cos(x_true(3) - best_pose(3)));
-            set(h.err_theta, 'XData', [get(h.err_theta, 'XData'), t], ...
-                'YData', [get(h.err_theta, 'YData'), abs(theta_err)]);
+            if isempty(err_t_hist) || err_t_hist(end) ~= t
+                err_t_hist   = [err_t_hist, t];
+                err_x_hist   = [err_x_hist, abs(x_true(1) - best_pose(1))];
+                err_y_hist   = [err_y_hist, abs(x_true(2) - best_pose(2))];
+                theta_err    = atan2(sin(x_true(3) - best_pose(3)), cos(x_true(3) - best_pose(3)));
+                err_th_hist  = [err_th_hist, abs(theta_err)];
+            end
+            set(h.err_x, 'XData', err_t_hist, 'YData', err_x_hist);
+            set(h.err_y, 'XData', err_t_hist, 'YData', err_y_hist);
+            set(h.err_theta, 'XData', err_t_hist, 'YData', err_th_hist);
         end
         
         % --- 权重分布 (Top 30) ---

@@ -42,13 +42,25 @@ function [should_replan, trigger_params] = trigger_conditions(belief, state, tri
     
     % [3] 不确定性触发（自适应阈值）
     if isfield(belief, 'pose_cov') && ~isempty(belief.pose_cov)
-        pose_uncertainty = det(belief.pose_cov);
+        pose_uncertainty = trace(belief.pose_cov);
         adaptive_threshold = trigger_params.sigma_threshold * ...
                              (trigger_params.alpha_decay ^ trigger_params.time_counter);
         if pose_uncertainty > adaptive_threshold
             should_replan = true;
             trigger_params.time_counter = 0;
             trigger_params.reason = 'high_uncertainty';
+            return;
+        end
+    end
+    
+    % [3.5] 回环检测触发：不确定性严重超标，必须主动回环校正
+    if isfield(trigger_params, 'loop_closure_threshold') && ...
+       isfield(belief, 'pose_cov') && ~isempty(belief.pose_cov)
+        pose_uncertainty = trace(belief.pose_cov);
+        if pose_uncertainty > trigger_params.loop_closure_threshold
+            should_replan = true;
+            trigger_params.time_counter = 0;
+            trigger_params.reason = 'loop_closure';
             return;
         end
     end
